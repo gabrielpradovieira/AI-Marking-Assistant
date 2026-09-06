@@ -1,5 +1,5 @@
 import sys
-import time
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -10,7 +10,7 @@ from maya_worker import (
     _find_enclosed_shells,
     _find_extra_cameras,
     _find_hidden_objects,
-    _run_with_timeout,
+    _run_safely,
     audit_model_file,
     process_jobs,
 )
@@ -87,29 +87,38 @@ def test_audit_model_file_dirty_scene():
     assert result["image_planes"] == 1
 
 
-def test_run_with_timeout_returns_value_on_success():
-    value, error = _run_with_timeout(lambda: 42, timeout=1)
+def test_run_safely_returns_value_on_success():
+    value, error = _run_safely(lambda: 42)
     assert value == 42
     assert error is None
 
 
-def test_run_with_timeout_captures_exception():
+def test_run_safely_captures_exception():
     def boom():
         raise RuntimeError("scene is corrupt")
 
-    value, error = _run_with_timeout(boom, timeout=1)
+    value, error = _run_safely(boom)
     assert value is None
     assert "scene is corrupt" in error
 
 
-def test_run_with_timeout_reports_timeout():
-    def hang():
-        time.sleep(2)
-        return "too late"
+def test_run_safely_never_spawns_a_thread():
+    """Regression test: a real Maya bug (TypeError: Flag 'triangle' must be
+    passed a boolean argument, from cmds.polyEvaluate) turned out to be
+    caused by calling cmds from a background thread - Maya's command layer
+    is only safe to call from the process's main thread. _run_safely must
+    run func() inline, never in a spawned thread."""
+    calling_thread = threading.current_thread()
+    seen = {}
 
-    value, error = _run_with_timeout(hang, timeout=0.2)
-    assert value is None
-    assert "Timed out" in error
+    def check_thread():
+        seen["thread"] = threading.current_thread()
+        return "ok"
+
+    value, error = _run_safely(check_thread)
+    assert value == "ok"
+    assert error is None
+    assert seen["thread"] is calling_thread
 
 
 def test_process_jobs_retries_once_then_skips():
@@ -125,7 +134,7 @@ def test_process_jobs_retries_once_then_skips():
     try:
         jobs = [{"competitor": "09", "model_path": "bad.mb", "triangle_budget": 10000}]
         recorded = {}
-        results = process_jobs(jobs, cmds=FakeCmds(), timeout=1,
+        results = process_jobs(jobs, cmds=FakeCmds(),
                                 on_result=lambda c, r: recorded.__setitem__(c, r))
     finally:
         maya_worker.audit_model_file = original
@@ -150,7 +159,7 @@ def test_process_jobs_succeeds_after_one_retry():
     maya_worker.audit_model_file = flaky_audit
     try:
         jobs = [{"competitor": "10", "model_path": "flaky.mb", "triangle_budget": 10000}]
-        results = process_jobs(jobs, cmds=FakeCmds(), timeout=1, on_result=lambda c, r: None)
+        results = process_jobs(jobs, cmds=FakeCmds(), on_result=lambda c, r: None)
     finally:
         maya_worker.audit_model_file = original
 
@@ -173,7 +182,7 @@ def test_process_jobs_continues_after_one_file_fails():
             {"competitor": "01", "model_path": "bad.mb", "triangle_budget": 10000},
             {"competitor": "02", "model_path": "good.mb", "triangle_budget": 10000},
         ]
-        results = process_jobs(jobs, cmds=FakeCmds(), timeout=1, on_result=lambda c, r: None)
+        results = process_jobs(jobs, cmds=FakeCmds(), on_result=lambda c, r: None)
     finally:
         maya_worker.audit_model_file = original
 

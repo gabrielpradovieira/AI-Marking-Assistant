@@ -84,11 +84,15 @@ def run_maya_batch(
                 on_progress("maya_starting", None)
                 started = True
 
+            # maya_worker.py has no per-file timeout of its own (see its module
+            # docstring: cmds must only be called from the main thread, which
+            # rules out a watchdog-thread timeout). This whole-process timeout
+            # is the only enforcement - if it fires, we treat it as a crash
+            # and restart mayapy, skipping whichever file was in flight.
             total_timeout = MAYA_STARTUP_BUFFER_SECONDS + timeout_per_file * len(remaining) + 30
             cmd = [
                 str(mayapy_path), str(worker_path),
                 "--input", str(jobs_path), "--output", str(results_path),
-                "--timeout", str(timeout_per_file),
             ]
             try:
                 proc = subprocess.run(cmd, timeout=total_timeout, capture_output=True, text=True)

@@ -9,7 +9,7 @@ by the orchestrator (see maya_launcher.py), which restarts mayapy only for
 the files that never got a result.
 
 Usage:
-    mayapy maya_worker.py --input jobs.json --output results.json [--timeout 60]
+    mayapy maya_worker.py --input jobs.json --output results.json
 
 jobs.json:
     {"jobs": [{"competitor": "07", "model_path": "C:\\...\\....mb",
@@ -17,59 +17,50 @@ jobs.json:
 
 results.json (written incrementally):
     {"07": {"status": "ok", "triangles": 9412, "ngon_count": 0, ...},
-     "08": {"status": "error", "error": "Timed out after 60s"}}
+     "08": {"status": "error", "error": "..."}}
+
+IMPORTANT: every cmds call here must happen on this process's main thread.
+Maya's command layer is not thread-safe to call from a background Python
+thread - it produces misleading failures (e.g. "Flag 'triangle' must be
+passed a boolean argument" for a flag that unambiguously is one) rather
+than a clean error, because its internal flag validation relies on
+main-thread interpreter state. Maya's documented fix for this
+(`maya.utils.executeInMainThreadWithResult`) depends on the interactive
+idle-event queue, which doesn't exist in headless mayapy/maya.standalone,
+so it isn't an option here either. A genuine hang inside Maya itself is
+instead caught by the whole-process timeout in maya_launcher.py, which
+restarts mayapy and skips whichever file was in flight.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import threading
 import traceback
 from pathlib import Path
 
-DEFAULT_TIMEOUT = 60
 DEFAULT_CAMERAS = {"persp", "top", "front", "side"}
 
 
 # ---------------------------------------------------------------------------
-# Timeout / retry plumbing (no Maya dependency - testable on its own)
+# Retry plumbing (no Maya dependency - testable on its own)
 # ---------------------------------------------------------------------------
 
-def _run_with_timeout(func, timeout):
-    """Runs func() in a worker thread and enforces a soft timeout.
-
-    Maya's C++ layer cannot be safely pre-empted from Python - there is no
-    way to forcibly kill only "the current cmds call" without killing the
-    whole process. So this is best-effort: if func() doesn't return within
-    timeout, we stop waiting and report a timeout for this job, but the
-    thread itself is left running in the background (daemon=True) since it
-    cannot be cancelled. Ordinary exceptions (corrupt scene, bad geometry,
-    missing plugin) are caught here and returned rather than raised, which
-    covers the common failure case even without a true hang.
-    """
-    box: dict = {}
-
-    def target():
-        try:
-            box["value"] = func()
-        except Exception as exc:
-            box["error"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return None, f"Timed out after {timeout}s"
-    if "error" in box:
-        return None, box["error"]
-    return box.get("value"), None
+def _run_safely(func):
+    """Runs func() on the current thread and catches any exception, so one
+    corrupt scene or unsupported feature can't take down the whole batch.
+    Deliberately does NOT run func() on a background thread - see the
+    module docstring for why that breaks Maya's cmds calls."""
+    try:
+        return func(), None
+    except Exception as exc:
+        return None, "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
-def process_jobs(jobs, cmds, timeout, on_result):
-    """Runs audit_model_file for every job, retrying once on failure/timeout
-    before giving up on that file. Calls on_result(competitor, result_dict)
-    after each job completes so the caller can persist progress to disk
-    without waiting for the whole batch."""
+def process_jobs(jobs, cmds, on_result):
+    """Runs audit_model_file for every job, retrying once on failure before
+    giving up on that file. Calls on_result(competitor, result_dict) after
+    each job completes so the caller can persist progress to disk without
+    waiting for the whole batch."""
     results = {}
     for job in jobs:
         competitor = job["competitor"]
@@ -78,9 +69,8 @@ def process_jobs(jobs, cmds, timeout, on_result):
 
         value, error = None, None
         for _attempt in range(2):  # try once, retry once
-            value, error = _run_with_timeout(
-                lambda fp=filepath, tb=triangle_budget: audit_model_file(cmds, fp, tb),
-                timeout,
+            value, error = _run_safely(
+                lambda fp=filepath, tb=triangle_budget: audit_model_file(cmds, fp, tb)
             )
             if value is not None:
                 break
@@ -274,7 +264,6 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args(argv)
 
     jobs = json.loads(Path(args.input).read_text(encoding="utf-8")).get("jobs", [])
@@ -291,7 +280,7 @@ def main(argv=None) -> int:
         output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
     try:
-        process_jobs(jobs, maya_cmds, args.timeout, on_result)
+        process_jobs(jobs, maya_cmds, on_result)
     finally:
         try:
             maya.standalone.uninitialize()

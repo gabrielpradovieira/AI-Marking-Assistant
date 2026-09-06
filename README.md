@@ -83,16 +83,20 @@ bad file.
   FAILED" and scored as a fail - never a silent pass.
 - **`.max` files cannot be opened by Maya.** Competitors who submit a 3ds Max
   file get D1-D6 marked "MANUAL MARKING REQUIRED" rather than a crash.
-- **Per-file Maya timeouts are best-effort.** Maya's C++ layer can't be
-  safely pre-empted from Python, so a true infinite hang in Maya itself can
-  only be caught by the whole-process timeout in `maya_launcher.py` (which
-  restarts mayapy and skips the offending file), not a graceful per-call
-  cutoff.
-- The Maya-side audit code (`maya_worker.py`) is written from the documented
-  Maya Python API and has been validated with fake-Maya unit tests (see
-  `tests/fake_maya_cmds.py`), but has not been run against a real Maya
-  install in this environment. Test it against your Maya version before
-  relying on it for a live competition.
+- **`cmds` calls only ever happen on mayapy's main thread, deliberately.**
+  An earlier version ran each file's audit in a watchdog thread to enforce a
+  per-file timeout, which surfaced as a real bug: `cmds.polyEvaluate` (and
+  potentially other commands) raised misleading errors like `TypeError:
+  Flag 'triangle' must be passed a boolean argument` for flags that were
+  unambiguously booleans. This is a documented Maya limitation - the
+  command layer isn't safe to call off the main thread, and Maya's own fix
+  (`maya.utils.executeInMainThreadWithResult`) depends on the interactive
+  idle-event queue, which doesn't exist in headless mayapy. So there is no
+  per-call timeout inside `maya_worker.py` any more: a genuine hang in Maya
+  is caught only by the whole-process timeout in `maya_launcher.py`, which
+  restarts mayapy and skips whichever file was in flight when it fired.
+  Ordinary exceptions (corrupt scene, bad geometry) are still caught
+  in-process and retried once before being skipped.
 
 ## Testing
 
